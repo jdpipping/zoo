@@ -8,8 +8,8 @@
 # original scripts
 original/
 
-# raw data
-data/raw/
+# big data
+data/
 
 
 # venv
