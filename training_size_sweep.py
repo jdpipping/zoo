@@ -17,8 +17,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
+import lightgbm as lgb
+from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import log_loss
 import tensorflow as tf
 
@@ -28,6 +28,7 @@ from run_zoo import get_conv_net
 MIN_IDX_Y = 71
 MAX_IDX_Y = 150
 NUM_CLASSES = MAX_IDX_Y - MIN_IDX_Y + 1
+ALL_CLASSES = np.arange(NUM_CLASSES)
 
 
 @dataclass
@@ -47,8 +48,15 @@ def set_determinism(seed: int) -> None:
 def load_data(processed_dir: Path, raw_train_csv: Path) -> tuple[np.ndarray, pd.DataFrame, pd.DataFrame]:
     train_x = np.load(processed_dir / "train_x.npy")
     train_y = pd.read_pickle(processed_dir / "train_y.pkl")
-    raw = pd.read_csv(raw_train_csv, usecols=["GameId", "PlayId"]).drop_duplicates("PlayId")
+    raw = pd.read_csv(raw_train_csv, usecols=["GameId", "PlayId"])
     raw["PlayId"] = raw["PlayId"].astype(str)
+    gcount = raw.groupby("PlayId")["GameId"].nunique()
+    bad = gcount[gcount > 1]
+    if len(bad) > 0:
+        raise ValueError(
+            "PlayId maps to multiple GameIds. Rebuild processed data using (GameId, PlayId) keys."
+        )
+    raw = raw.drop_duplicates("PlayId")
 
     play_map = train_y[["PlayId"]].copy()
     play_map["PlayId"] = play_map["PlayId"].astype(str)
@@ -124,8 +132,8 @@ def evaluate_with_conformal(
 
     q = conformal_padding(cal_y, cal_l, cal_u, alpha)
 
-    lo = test_l - q
-    hi = test_u + q
+    lo = np.maximum(0, test_l - q)
+    hi = np.minimum(NUM_CLASSES - 1, test_u + q)
     width = hi - lo
     covered = (test_y >= lo) & (test_y <= hi)
 
@@ -136,28 +144,82 @@ def evaluate_with_conformal(
     }
 
 
+def _proba_to_num_classes(proba: np.ndarray, model_classes: np.ndarray) -> np.ndarray:
+    """Expand predict_proba to (n, NUM_CLASSES); proba column j is class model_classes[j]."""
+    out = np.zeros((proba.shape[0], NUM_CLASSES), dtype=np.float64)
+    for j, c in enumerate(model_classes):
+        if 0 <= c < NUM_CLASSES:
+            out[:, c] = proba[:, j]
+    return out
+
+
+def fit_ridge_fixed_classes(
+    x: np.ndarray,
+    y: np.ndarray,
+    alpha: float,
+    seed: int,
+    batch_size: int = 64,
+    n_epochs: int = 50,
+) -> SGDClassifier:
+    """Fit SGDClassifier over fixed class set so proba always has NUM_CLASSES columns."""
+    clf = SGDClassifier(
+        loss="log_loss",
+        penalty="l2",
+        alpha=alpha,
+        random_state=seed,
+        max_iter=1,
+        warm_start=False,
+    )
+    n = len(x)
+    rng = np.random.default_rng(seed)
+    first_batch = True
+    for _ in range(n_epochs):
+        perm = rng.permutation(n)
+        for start in range(0, n, batch_size):
+            idx = perm[start : start + batch_size]
+            if len(idx) == 0:
+                continue
+            X_batch = x[idx]
+            y_batch = y[idx]
+            if first_batch:
+                clf.partial_fit(X_batch, y_batch, classes=ALL_CLASSES)
+                first_batch = False
+            else:
+                clf.partial_fit(X_batch, y_batch)
+    return clf
+
+
 def tune_ridge(x: np.ndarray, y: np.ndarray, seed: int) -> float:
     n = min(5000, len(x))
     x_dev = x[:n]
     y_dev = y[:n]
-    cs = [0.1, 0.3, 1.0, 3.0]
-    best_c = cs[0]
+    # SGDClassifier uses alpha (reg strength); map from C (inverse reg): alpha = 1/C
+    alphas = [1.0 / c for c in (0.1, 0.3, 1.0, 3.0)]
+    best_alpha = alphas[0]
     best_nll = float("inf")
-    for c in cs:
-        model = LogisticRegression(
-            C=c,
-            penalty="l2",
-            multi_class="multinomial",
-            solver="saga",
-            max_iter=200,
-            random_state=seed,
-            n_jobs=-1,
-        )
-        model.fit(x_dev, y_dev)
-        nll = log_loss(y_dev, model.predict_proba(x_dev), labels=np.arange(NUM_CLASSES))
+    for alpha in alphas:
+        model = fit_ridge_fixed_classes(x_dev, y_dev, alpha=alpha, seed=seed)
+        proba = _proba_to_num_classes(model.predict_proba(x_dev), model.classes_)
+        nll = log_loss(y_dev, proba, labels=ALL_CLASSES)
         if nll < best_nll:
-            best_nll, best_c = nll, c
-    return best_c
+            best_nll, best_alpha = nll, alpha
+    return best_alpha
+
+
+def fit_tree_fixed_classes(
+    x: np.ndarray, y: np.ndarray, params: dict, seed: int
+) -> lgb.LGBMClassifier:
+    """Single LightGBM multiclass fit with num_class=NUM_CLASSES so proba always has 80 columns."""
+    model = lgb.LGBMClassifier(
+        objective="multiclass",
+        num_class=NUM_CLASSES,
+        n_estimators=200,
+        random_state=seed,
+        verbose=-1,
+        **params,
+    )
+    model.fit(x, y)
+    return model
 
 
 def tune_tree(x: np.ndarray, y: np.ndarray, seed: int) -> dict[str, float]:
@@ -172,32 +234,41 @@ def tune_tree(x: np.ndarray, y: np.ndarray, seed: int) -> dict[str, float]:
     best = grid[0]
     best_nll = float("inf")
     for params in grid:
-        model = HistGradientBoostingClassifier(
-            loss="log_loss",
-            max_iter=200,
-            random_state=seed,
-            **params,
-        )
-        model.fit(x_dev, y_dev)
-        nll = log_loss(y_dev, model.predict_proba(x_dev), labels=np.arange(NUM_CLASSES))
+        model = fit_tree_fixed_classes(x_dev, y_dev, params, seed=seed)
+        proba = _proba_to_num_classes(model.predict_proba(x_dev), model.classes_)
+        nll = log_loss(y_dev, proba, labels=ALL_CLASSES)
         if nll < best_nll:
             best_nll, best = nll, params
     return best
 
 
-def train_cnn(train_x: np.ndarray, y_train: np.ndarray, seed: int) -> tf.keras.Model:
+def train_cnn(train_x: np.ndarray, y_train: np.ndarray, seed: int, epochs: int = 8) -> tf.keras.Model:
     tf.random.set_seed(seed)
     model = get_conv_net(NUM_CLASSES)
     model.compile(loss="categorical_crossentropy", optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3))
-    model.fit(train_x, one_hot_labels(y_train + MIN_IDX_Y), epochs=8, batch_size=64, verbose=0)
+    model.fit(train_x, one_hot_labels(y_train + MIN_IDX_Y), epochs=epochs, batch_size=64, verbose=0)
     return model
 
 
-def run_sweep(alpha: float, seed: int, out_dir: Path, processed_dir: Path, raw_csv: Path) -> None:
+def run_sweep(
+    alpha: float,
+    seed: int,
+    out_dir: Path,
+    processed_dir: Path,
+    raw_csv: Path,
+    toy: bool = False,
+) -> None:
     set_determinism(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     train_x, train_y, play_map = load_data(processed_dir, raw_csv)
+    # Drop _aug plays so cal/test and play counts are on original plays only
+    is_aug = play_map["PlayId"].str.endswith("_aug").to_numpy()
+    keep = ~is_aug
+    train_x = train_x[keep]
+    train_y = train_y.iloc[keep].reset_index(drop=True)
+    play_map = play_map.iloc[keep].reset_index(drop=True)
+
     tab_x = make_tabular_features(train_x)
     y_idx = train_y["YardIndexClipped"].to_numpy(dtype=int)
     y_cls = y_idx - MIN_IDX_Y
@@ -210,48 +281,40 @@ def run_sweep(alpha: float, seed: int, out_dir: Path, processed_dir: Path, raw_c
     rng = np.random.default_rng(seed)
     perm_train_pool = rng.permutation(train_pool)
 
-    ridge_c = tune_ridge(tab_x[perm_train_pool], y_cls[perm_train_pool], seed)
+    ridge_alpha = tune_ridge(tab_x[perm_train_pool], y_cls[perm_train_pool], seed)
     tree_params = tune_tree(tab_x[perm_train_pool], y_cls[perm_train_pool], seed)
 
     n_max = (len(train_pool) // 1000) * 1000
     sizes = list(range(1000, n_max + 1, 1000))
+    if toy:
+        sizes = sizes[:2]
+        cnn_epochs = 2
+    else:
+        cnn_epochs = 8
     rows: list[dict[str, float | int | str]] = []
 
     for n_train in sizes:
         subset = perm_train_pool[:n_train]
 
-        ridge = LogisticRegression(
-            C=ridge_c,
-            penalty="l2",
-            multi_class="multinomial",
-            solver="saga",
-            max_iter=200,
-            random_state=seed,
-            n_jobs=-1,
+        ridge = fit_ridge_fixed_classes(
+            tab_x[subset], y_cls[subset], alpha=ridge_alpha, seed=seed
         )
-        ridge.fit(tab_x[subset], y_cls[subset])
-        ridge_cal = ridge.predict_proba(tab_x[cal_idx])
-        ridge_test = ridge.predict_proba(tab_x[test_idx])
+        ridge_cal = _proba_to_num_classes(ridge.predict_proba(tab_x[cal_idx]), ridge.classes_)
+        ridge_test = _proba_to_num_classes(ridge.predict_proba(tab_x[test_idx]), ridge.classes_)
         ridge_metrics = evaluate_with_conformal(ridge_cal, ridge_test, y_cls[cal_idx], y_cls[test_idx], alpha)
-        ridge_metrics["nll"] = float(log_loss(y_cls[test_idx], ridge_test, labels=np.arange(NUM_CLASSES)))
+        ridge_metrics["nll"] = float(log_loss(y_cls[test_idx], ridge_test, labels=ALL_CLASSES))
 
-        tree = HistGradientBoostingClassifier(
-            loss="log_loss",
-            max_iter=200,
-            random_state=seed,
-            **tree_params,
-        )
-        tree.fit(tab_x[subset], y_cls[subset])
-        tree_cal = tree.predict_proba(tab_x[cal_idx])
-        tree_test = tree.predict_proba(tab_x[test_idx])
+        tree = fit_tree_fixed_classes(tab_x[subset], y_cls[subset], tree_params, seed=seed)
+        tree_cal = _proba_to_num_classes(tree.predict_proba(tab_x[cal_idx]), tree.classes_)
+        tree_test = _proba_to_num_classes(tree.predict_proba(tab_x[test_idx]), tree.classes_)
         tree_metrics = evaluate_with_conformal(tree_cal, tree_test, y_cls[cal_idx], y_cls[test_idx], alpha)
-        tree_metrics["nll"] = float(log_loss(y_cls[test_idx], tree_test, labels=np.arange(NUM_CLASSES)))
+        tree_metrics["nll"] = float(log_loss(y_cls[test_idx], tree_test, labels=ALL_CLASSES))
 
-        cnn_model = train_cnn(train_x[subset], y_cls[subset], seed)
+        cnn_model = train_cnn(train_x[subset], y_cls[subset], seed, epochs=cnn_epochs)
         cnn_cal = cnn_model.predict(train_x[cal_idx], verbose=0)
         cnn_test = cnn_model.predict(train_x[test_idx], verbose=0)
         cnn_metrics = evaluate_with_conformal(cnn_cal, cnn_test, y_cls[cal_idx], y_cls[test_idx], alpha)
-        cnn_metrics["nll"] = float(log_loss(y_cls[test_idx], cnn_test, labels=np.arange(NUM_CLASSES)))
+        cnn_metrics["nll"] = float(log_loss(y_cls[test_idx], cnn_test, labels=ALL_CLASSES))
 
         for model_name, metrics in [
             ("ridge_multinomial", ridge_metrics),
@@ -282,7 +345,7 @@ def run_sweep(alpha: float, seed: int, out_dir: Path, processed_dir: Path, raw_c
     make_plot(results, alpha=alpha, output_path=plot_path)
 
     readme_path = out_dir / "experiment_README.md"
-    write_experiment_readme(readme_path, alpha=alpha, seed=seed, ridge_c=ridge_c, tree_params=tree_params)
+    write_experiment_readme(readme_path, alpha=alpha, seed=seed, ridge_alpha=ridge_alpha, tree_params=tree_params)
 
     config_path = out_dir / "run_config.json"
     config_path.write_text(
@@ -324,7 +387,9 @@ def make_plot(results: pd.DataFrame, alpha: float, output_path: Path) -> None:
     plt.close(fig)
 
 
-def write_experiment_readme(path: Path, alpha: float, seed: int, ridge_c: float, tree_params: dict[str, float]) -> None:
+def write_experiment_readme(
+    path: Path, alpha: float, seed: int, ridge_alpha: float, tree_params: dict[str, float]
+) -> None:
     path.write_text(
         "\n".join(
             [
@@ -335,7 +400,7 @@ def write_experiment_readme(path: Path, alpha: float, seed: int, ridge_c: float,
                 f"- Label support: YardIndexClipped in [{MIN_IDX_Y}, {MAX_IDX_Y}] ({NUM_CLASSES} classes).",
                 "- Conformal method: interval-from-distribution central interval + calibration padding q via finite-sample conformal quantile.",
                 f"- Seed: {seed}.",
-                f"- Frozen hyperparameters: Ridge C={ridge_c}; Tree params={tree_params}; CNN from `run_zoo.get_conv_net` with fixed optimizer/training schedule.",
+                f"- Frozen hyperparameters: Ridge (SGD) alpha={ridge_alpha}; Tree (LightGBM multiclass, num_class={NUM_CLASSES}) params={tree_params}; CNN from `run_zoo.get_conv_net` with fixed optimizer/training schedule.",
             ]
         )
     )
@@ -345,12 +410,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run training-size conformal stability sweep.")
     parser.add_argument("--alpha", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--toy", action="store_true", help="Quick run: 2 training sizes, 2 CNN epochs. Use to verify pipeline and outputs.")
     parser.add_argument("--processed-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--raw-train-csv", type=Path, default=Path("data/raw/train.csv"))
-    parser.add_argument("--out-dir", type=Path, default=Path("outputs/training_size_sweep"))
+    parser.add_argument("--out-dir", type=Path, default=Path("plots/training_size_sweep"))
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run_sweep(alpha=args.alpha, seed=args.seed, out_dir=args.out_dir, processed_dir=args.processed_dir, raw_csv=args.raw_train_csv)
+    run_sweep(
+        alpha=args.alpha,
+        seed=args.seed,
+        out_dir=args.out_dir,
+        processed_dir=args.processed_dir,
+        raw_csv=args.raw_train_csv,
+        toy=args.toy,
+    )
