@@ -3,7 +3,11 @@ Load prepared data and run the zoo: 8-fold CV training of CNNs.
 Run prepare_data.py first. Expects data/processed/train_x.npy, train_y.pkl, df_season.pkl.
 """
 
+import json
 import time
+from datetime import datetime, timezone
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -201,7 +205,28 @@ def main():
         avg_min = np.mean([r[1] for r in results])
         print(f"Avg fold {avg_min:.1f} min -> serial total ~{8 * avg_min:.1f} min")
 
-    print("Mean val CRPS:", np.mean(score))
+    mean_crps = float(np.mean(score))
+    print("Mean val CRPS:", mean_crps)
+
+    out_dir = Path("data/results")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_path = out_dir / "zoo_cv_results.json"
+    results_path.write_text(
+        json.dumps(
+            {
+                "mean_val_crps": mean_crps,
+                "fold_val_crps": [float(s) for s in score],
+                "n_splits": 8,
+                "random_state": 42,
+                "epochs": 50,
+                "batch_size": 64,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+    )
+    print(f"Saved results to {results_path}")
+
     return models, score
 
 
