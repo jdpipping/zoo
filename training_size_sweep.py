@@ -105,6 +105,7 @@ def one_hot_labels(yard_idx_clipped: np.ndarray) -> np.ndarray:
 
 
 def central_interval_from_proba(proba: np.ndarray, alpha: float) -> tuple[np.ndarray, np.ndarray]:
+    proba = normalize_proba_rows(proba)
     cdf = np.cumsum(proba, axis=1)
     lower = np.argmax(cdf >= (alpha / 2.0), axis=1)
     upper = np.argmax(cdf >= (1.0 - alpha / 2.0), axis=1)
@@ -144,13 +145,26 @@ def evaluate_with_conformal(
     }
 
 
+def normalize_proba_rows(proba: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Return row-normalized probabilities for stable metrics and interval construction."""
+    p = np.asarray(proba, dtype=np.float64)
+    p = np.clip(p, eps, None)
+    row_sums = p.sum(axis=1, keepdims=True)
+    # Guard against pathological all-zero/NaN rows from upstream models.
+    bad = ~np.isfinite(row_sums) | (row_sums <= 0)
+    if np.any(bad):
+        p[bad[:, 0]] = 1.0 / p.shape[1]
+        row_sums = p.sum(axis=1, keepdims=True)
+    return p / row_sums
+
+
 def _proba_to_num_classes(proba: np.ndarray, model_classes: np.ndarray) -> np.ndarray:
     """Expand predict_proba to (n, NUM_CLASSES); proba column j is class model_classes[j]."""
     out = np.zeros((proba.shape[0], NUM_CLASSES), dtype=np.float64)
     for j, c in enumerate(model_classes):
         if 0 <= c < NUM_CLASSES:
             out[:, c] = proba[:, j]
-    return out
+    return normalize_proba_rows(out)
 
 
 def fit_ridge_fixed_classes(
