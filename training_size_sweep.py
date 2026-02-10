@@ -395,7 +395,7 @@ def run_sweep(
     readme_path = out_dir / "sweep_README.md"
     write_experiment_readme(readme_path, alpha=alpha, seed=seed, ridge_alpha=ridge_alpha, tree_params=tree_params, max_k=max_k)
 
-    config_path = out_dir / f"{output_stem}_run_config.json"
+    config_path = out_dir / f"{output_stem}_config.json"
     config_path.write_text(
         json.dumps(
             {

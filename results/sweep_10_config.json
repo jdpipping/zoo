@@ -1,0 +1,8 @@
+{
+  "max_k": 10,
+  "seed": 123,
+  "alpha": 0.1,
+  "label_support": [71, 150],
+  "split": "gameId: train_pool=60%, calibration=20%, test=20%",
+  "nested_subsets": "first n plays from one seeded permutation"
+}
