@@ -11,6 +11,9 @@ original/
 # finder tracker
 .DS_Store
 
+# venv
+*env/
+
 #########
 ### R ###
 #########
