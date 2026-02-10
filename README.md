@@ -49,14 +49,10 @@ Run the fixed-split training-size sweep and create the 2-panel stability plot:
 python training_size_sweep.py --alpha 0.10 --seed 123
 ```
 
-Quick sanity check (5 training sizes: 1k–5k plays; full 50-epoch Zoo; outputs in `results/`):
+Quick run (sweep up to 10k only; writes `sweep_10.csv`, `sweep_10.png`, and one `sweep_README.md`):
 
 ```bash
-python training_size_sweep.py --toy
+python training_size_sweep.py --max-k 10
 ```
 
-Outputs are written to `results/` (override with `--out-dir`):
-
-- `sweep.csv` — `model, n_train, mean_width, coverage, nll, q_padding, seed, alpha, timestamp`
-- `sweep.png` — 2-panel width/coverage figure
-- `run_config.json`
+Outputs in `results/` (override with `--out-dir`): `sweep_{max_k}.csv`, `sweep_{max_k}.png`, `sweep_{max_k}_config.json`, and a single **sweep_README.md** (overwritten each run) describing the sweep (including `--max-k`).
