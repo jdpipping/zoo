@@ -40,3 +40,18 @@ Reference material lives in `original/`:
 - [Pytorch version](original/pytorch_version.ipynb) — graph neural nets (torch geometric)
 - [Player influence area CNN](original/my_solution.ipynb)
 - [Graph convolutional network](original/nfl_graph_neural_networks_v1.ipynb)
+
+## Training-size conformal sweep (Ridge / Tree / Zoo CNN)
+
+Run the fixed-split training-size sweep and create the 2-panel stability plot:
+
+```bash
+python training_size_conformal_sweep.py --alpha 0.10 --seed 123
+```
+
+Outputs are written to `outputs/training_size_sweep/`:
+
+- `training_size_sweep_results.csv` with `model, n_train, mean_width, coverage, nll, q_padding, seed, alpha, timestamp`
+- `training_size_sweep.png` (2-panel width/coverage figure)
+- `experiment_README.md` documenting split, alpha, label support, and frozen hyperparameters
+- `run_config.json`
