@@ -46,10 +46,12 @@ else:
 
 
 def crps(y_true, y_pred):
+    """CRPS for ordinal outcome: L2 on cumulative distributions (scaled by 199)."""
     return K.mean(K.sum((K.cumsum(y_pred, axis=1) - K.cumsum(y_true, axis=1)) ** 2, axis=1)) / 199
 
 
 def get_conv_net(num_classes_y):
+    """Zoo CNN: 11×10×10 input → conv/pool → softmax over yard bins (from 1st-place solution)."""
     inp = Input(shape=(11, 10, 10), name="playersfeatures_input")
     X = Conv2D(128, (1, 1), activation="relu")(inp)
     X = Conv2D(160, (1, 1), activation="relu")(X)
@@ -79,7 +81,7 @@ def get_conv_net(num_classes_y):
 
 
 class Metric(Callback):
-    """Val CRPS from cumulative predictions for EarlyStopping."""
+    """Compute val_CRPS each epoch so EarlyStopping can monitor it."""
 
     def __init__(self, model, callbacks, data):
         super().__init__()
@@ -106,6 +108,7 @@ class Metric(Callback):
 
 
 def _train_one_fold(args):
+    """Train one CNN fold (for parallel workers); exclude 2017 from val for fair CRPS."""
     fold_idx, tdx, vdx, train_x, train_y, df_season, num_classes_y, min_idx_y = args
     t0 = time.perf_counter()
     X_train = train_x[tdx]
@@ -143,6 +146,7 @@ def estimate_cv_runtime(n_folds=8, minutes_per_fold=None):
 
 
 def main():
+    """8-fold CV: train Zoo CNN per fold with CRPS + early stopping, report mean val CRPS."""
     train_x = np.load(TRAIN_X_PATH)
     train_y = pd.read_pickle(TRAIN_Y_PATH)
     df_season = pd.read_pickle(DF_SEASON_PATH)
@@ -168,7 +172,7 @@ def main():
             for irow, row in enumerate(y_val - MIN_IDX_Y):
                 y_val_oh[irow, row] = 1
 
-            val_idx = np.where(season_val != 2017)[0]
+            val_idx = np.where(season_val != 2017)[0]  # Exclude 2017 from val (different season).
             X_val = X_val[val_idx]
             y_val_oh = y_val_oh[val_idx].astype("float32")
             y_train_oh = y_train_oh.astype("float32")

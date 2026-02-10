@@ -77,6 +77,7 @@ def process_tracking_data(df):
 
 
 def main():
+    """Build CNN input tensor and labels from raw CSV; add ~50% mirror-augmented plays (_aug)."""
     train = pd.read_csv(TRAIN_CSV, dtype={"WindSpeed": "object"})
     df_play, df_players = split_play_and_player_cols(train)
     process_team_abbr(df_play, train)
@@ -88,7 +89,7 @@ def main():
 
     np.random.seed(AUGMENT_SEED)
     n_plays = len(df_play.PlayId.unique())
-    sample_ids = np.random.choice(df_play.PlayId.unique(), int(0.5 * n_plays))
+    sample_ids = np.random.choice(df_play.PlayId.unique(), int(0.5 * n_plays))  # Mirror ~50% of plays.
     df_players_aug = data_augmentation(df_players, sample_ids)
     df_players = pd.concat([df_players, df_players_aug], ignore_index=True)
     df_play_aug = df_play.loc[df_play.PlayId.isin(sample_ids)].copy()
@@ -105,7 +106,7 @@ def main():
     df_all = df_players[feats]
     grouped = df_all.groupby("PlayId")
     play_ids_ordered = df_play.PlayId.values
-    train_x = np.zeros([len(grouped.size()), 11, 10, 10], dtype=np.float32)
+    train_x = np.zeros([len(grouped.size()), 11, 10, 10], dtype=np.float32)  # [plays, 11 def, 10 off, 10 ch].
     for i, (name, group) in enumerate(grouped):
         assert name == play_ids_ordered[i]
         [[rx, ry, rSx, rSy]] = group.loc[group.IsRusher == 1, ["X_std", "Y_std", "Sx", "Sy"]].values

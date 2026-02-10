@@ -47,6 +47,7 @@ def set_determinism(seed: int) -> None:
 
 
 def load_data(processed_dir: Path, raw_train_csv: Path) -> tuple[np.ndarray, pd.DataFrame, pd.DataFrame]:
+    """Load processed features/labels and attach GameId via raw CSV; assert PlayId unique per game."""
     train_x = np.load(processed_dir / "train_x.npy")
     train_y = pd.read_pickle(processed_dir / "train_y.pkl")
     raw = pd.read_csv(raw_train_csv, usecols=["GameId", "PlayId"])
@@ -69,6 +70,7 @@ def load_data(processed_dir: Path, raw_train_csv: Path) -> tuple[np.ndarray, pd.
 
 
 def build_game_split(play_map: pd.DataFrame, seed: int, train_frac: float = 0.6, cal_frac: float = 0.2) -> SplitData:
+    """Split by game (60% train pool, 20% cal, 20% test) so cal/test are fixed across n_train."""
     rng = np.random.default_rng(seed)
     games = np.array(sorted(play_map["GameId"].unique()))
     rng.shuffle(games)
@@ -90,6 +92,7 @@ def build_game_split(play_map: pd.DataFrame, seed: int, train_frac: float = 0.6,
 
 
 def make_tabular_features(train_x: np.ndarray) -> np.ndarray:
+    """Flatten spatial dims and aggregate min/mean/max/std for ridge and tree."""
     flat = train_x.reshape(train_x.shape[0], -1, train_x.shape[-1])
     mins = flat.min(axis=1)
     means = flat.mean(axis=1)
@@ -106,6 +109,7 @@ def one_hot_labels(yard_idx_clipped: np.ndarray) -> np.ndarray:
 
 
 def central_interval_from_proba(proba: np.ndarray, alpha: float) -> tuple[np.ndarray, np.ndarray]:
+    """(alpha/2, 1-alpha/2) quantiles of predictive CDF per sample → lower/upper bin indices."""
     proba = normalize_proba_rows(proba)
     cdf = np.cumsum(proba, axis=1)
     lower = np.argmax(cdf >= (alpha / 2.0), axis=1)
@@ -114,6 +118,7 @@ def central_interval_from_proba(proba: np.ndarray, alpha: float) -> tuple[np.nda
 
 
 def conformal_padding(cal_y: np.ndarray, cal_l: np.ndarray, cal_u: np.ndarray, alpha: float) -> int:
+    """Nonconformity scores on cal set; return empirical (1-alpha) quantile as padding q."""
     scores = np.maximum.reduce([cal_l - cal_y, cal_y - cal_u, np.zeros_like(cal_y)])
     n = len(scores)
     k = int(math.ceil((n + 1) * (1 - alpha)))
@@ -129,6 +134,7 @@ def evaluate_with_conformal(
     test_y: np.ndarray,
     alpha: float,
 ) -> dict[str, float]:
+    """Central interval from model + conformal q on cal; report mean width and coverage on test."""
     cal_l, cal_u = central_interval_from_proba(cal_proba, alpha)
     test_l, test_u = central_interval_from_proba(test_proba, alpha)
 
@@ -205,6 +211,7 @@ def fit_ridge_fixed_classes(
 
 
 def tune_ridge(x: np.ndarray, y: np.ndarray, seed: int) -> float:
+    """Pick ridge alpha (1/C) by best NLL on first 5k samples."""
     n = min(5000, len(x))
     x_dev = x[:n]
     y_dev = y[:n]
@@ -238,6 +245,7 @@ def fit_tree_fixed_classes(
 
 
 def tune_tree(x: np.ndarray, y: np.ndarray, seed: int) -> dict[str, float]:
+    """Pick learning_rate and max_depth by best NLL on first 5k samples."""
     n = min(5000, len(x))
     x_dev = x[:n]
     y_dev = y[:n]
@@ -296,7 +304,7 @@ def run_sweep(
     out_dir: Path,
     processed_dir: Path,
     raw_csv: Path,
-    toy: bool = False,
+    max_k: int = 50,
 ) -> None:
     set_determinism(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -318,6 +326,7 @@ def run_sweep(
     cal_idx = split.calibration_idx
     test_idx = split.test_idx
 
+    # One permutation of train pool; we take first n_train for each size (cal/test fixed).
     rng = np.random.default_rng(seed)
     perm_train_pool = rng.permutation(train_pool)
 
@@ -325,14 +334,15 @@ def run_sweep(
     tree_params = tune_tree(tab_x[perm_train_pool], y_cls[perm_train_pool], seed)
 
     n_max = (len(train_pool) // 1000) * 1000
-    sizes = list(range(1000, n_max + 1, 1000))
-    if toy:
-        sizes = sizes[:5]  # 1k through 5k
-    cnn_epochs = 50  # full Zoo (match run_zoo) for both toy and full sweep
+    # Sizes 1k, 2k, ... up to max_k thousand (capped by data)
+    max_n = min(max_k * 1000, n_max)
+    sizes = list(range(1000, max_n + 1, 1000))
+    cnn_epochs = 50  # full Zoo (match run_zoo)
+    output_stem = f"sweep_{max_k}"
     rows: list[dict[str, float | int | str]] = []
 
     for n_train in sizes:
-        subset = perm_train_pool[:n_train]
+        subset = perm_train_pool[:n_train]  # Train on first n_train plays only.
 
         ridge = fit_ridge_fixed_classes(
             tab_x[subset], y_cls[subset], alpha=ridge_alpha, seed=seed
@@ -376,19 +386,20 @@ def run_sweep(
         print(f"Done n_train={n_train}")
 
     results = pd.DataFrame(rows)
-    results_path = out_dir / "sweep.csv"
+    results_path = out_dir / f"{output_stem}.csv"
     results.to_csv(results_path, index=False)
 
-    plot_path = out_dir / "sweep.png"
+    plot_path = out_dir / f"{output_stem}.png"
     make_plot(results, alpha=alpha, output_path=plot_path)
 
-    readme_path = out_dir / "experiment_README.md"
-    write_experiment_readme(readme_path, alpha=alpha, seed=seed, ridge_alpha=ridge_alpha, tree_params=tree_params)
+    readme_path = out_dir / "sweep_README.md"
+    write_experiment_readme(readme_path, alpha=alpha, seed=seed, ridge_alpha=ridge_alpha, tree_params=tree_params, max_k=max_k)
 
-    config_path = out_dir / "run_config.json"
+    config_path = out_dir / f"{output_stem}_run_config.json"
     config_path.write_text(
         json.dumps(
             {
+                "max_k": max_k,
                 "seed": seed,
                 "alpha": alpha,
                 "label_support": [MIN_IDX_Y, MAX_IDX_Y],
@@ -402,6 +413,7 @@ def run_sweep(
 
 
 def make_plot(results: pd.DataFrame, alpha: float, output_path: Path) -> None:
+    """Two panels: mean conformal width and empirical coverage vs n_train."""
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
@@ -426,13 +438,19 @@ def make_plot(results: pd.DataFrame, alpha: float, output_path: Path) -> None:
 
 
 def write_experiment_readme(
-    path: Path, alpha: float, seed: int, ridge_alpha: float, tree_params: dict[str, float]
+    path: Path,
+    alpha: float,
+    seed: int,
+    ridge_alpha: float,
+    tree_params: dict[str, float],
+    max_k: int,
 ) -> None:
     path.write_text(
         "\n".join(
             [
                 "# Training-size conformal sweep",
                 "",
+                f"- Training sizes: 1k, 2k, … up to {max_k}k (controlled by `--max-k`).",
                 "- Split scheme: by `GameId` with fixed partitions train_pool=60%, calibration=20%, test=20%.",
                 f"- Miscoverage level: alpha={alpha} (target coverage={1-alpha:.2f}).",
                 f"- Label support: YardIndexClipped in [{MIN_IDX_Y}, {MAX_IDX_Y}] ({NUM_CLASSES} classes).",
@@ -448,7 +466,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run training-size conformal stability sweep.")
     parser.add_argument("--alpha", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--toy", action="store_true", help="Quick run: 5 training sizes (1k–5k) only; full 50-epoch Zoo. Use to verify pipeline and outputs.")
+    parser.add_argument("--max-k", type=int, default=50, help="Sweep training sizes 1k, 2k, … up to this many thousand. Outputs sweep_{max_k}.csv/.png; one sweep_README.md.")
     parser.add_argument("--processed-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--raw-train-csv", type=Path, default=Path("data/raw/train.csv"))
     parser.add_argument("--out-dir", type=Path, default=Path("results"))
@@ -463,5 +481,5 @@ if __name__ == "__main__":
         out_dir=args.out_dir,
         processed_dir=args.processed_dir,
         raw_csv=args.raw_train_csv,
-        toy=args.toy,
+        max_k=args.max_k,
     )
