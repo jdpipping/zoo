@@ -208,7 +208,7 @@ def main():
     mean_crps = float(np.mean(score))
     print("Mean val CRPS:", mean_crps)
 
-    out_dir = Path("data/results")
+    out_dir = Path("results")
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / "zoo_cv_results.json"
     results_path.write_text(

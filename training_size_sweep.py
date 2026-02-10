@@ -12,7 +12,7 @@ import math
 import os
 import random
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +22,8 @@ from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import log_loss
 import tensorflow as tf
 
-from run_zoo import get_conv_net
+from run_zoo import get_conv_net, crps, Metric
+from tensorflow.keras.callbacks import EarlyStopping
 
 
 MIN_IDX_Y = 71
@@ -256,11 +257,36 @@ def tune_tree(x: np.ndarray, y: np.ndarray, seed: int) -> dict[str, float]:
     return best
 
 
-def train_cnn(train_x: np.ndarray, y_train: np.ndarray, seed: int, epochs: int = 8) -> tf.keras.Model:
+def train_cnn(train_x: np.ndarray, y_train: np.ndarray, seed: int, epochs: int = 50) -> tf.keras.Model:
+    """Full Zoo: CRPS loss + early stopping on 20% val, matching run_zoo."""
     tf.random.set_seed(seed)
+    rng = np.random.default_rng(seed)
+    n = len(y_train)
+    perm = rng.permutation(n)
+    n_val = max(1, n // 5)
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+    X_train = train_x[train_idx]
+    X_val = train_x[val_idx]
+    y_train_oh = one_hot_labels(y_train[train_idx] + MIN_IDX_Y).astype(np.float32)
+    y_val_oh = one_hot_labels(y_train[val_idx] + MIN_IDX_Y).astype(np.float32)
+
     model = get_conv_net(NUM_CLASSES)
-    model.compile(loss="categorical_crossentropy", optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3))
-    model.fit(train_x, one_hot_labels(y_train + MIN_IDX_Y), epochs=epochs, batch_size=64, verbose=0)
+    es = EarlyStopping(
+        monitor="val_CRPS", mode="min", restore_best_weights=True, verbose=0, patience=10
+    )
+    es.set_model(model)
+    metric = Metric(model, [es], [X_val, y_val_oh])
+    model.compile(loss=crps, optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3))
+    model.fit(
+        X_train,
+        y_train_oh,
+        epochs=epochs,
+        batch_size=64,
+        verbose=0,
+        callbacks=[metric],
+        validation_data=(X_val, y_val_oh),
+    )
     return model
 
 
@@ -301,10 +327,8 @@ def run_sweep(
     n_max = (len(train_pool) // 1000) * 1000
     sizes = list(range(1000, n_max + 1, 1000))
     if toy:
-        sizes = sizes[:2]
-        cnn_epochs = 2
-    else:
-        cnn_epochs = 8
+        sizes = sizes[:5]  # 1k through 5k
+    cnn_epochs = 50  # full Zoo (match run_zoo) for both toy and full sweep
     rows: list[dict[str, float | int | str]] = []
 
     for n_train in sizes:
@@ -345,17 +369,17 @@ def run_sweep(
                     "q_padding": metrics["q_padding"],
                     "seed": seed,
                     "alpha": alpha,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             )
 
         print(f"Done n_train={n_train}")
 
     results = pd.DataFrame(rows)
-    results_path = out_dir / "training_size_sweep_results.csv"
+    results_path = out_dir / "sweep.csv"
     results.to_csv(results_path, index=False)
 
-    plot_path = out_dir / "training_size_sweep.png"
+    plot_path = out_dir / "sweep.png"
     make_plot(results, alpha=alpha, output_path=plot_path)
 
     readme_path = out_dir / "experiment_README.md"
@@ -414,7 +438,7 @@ def write_experiment_readme(
                 f"- Label support: YardIndexClipped in [{MIN_IDX_Y}, {MAX_IDX_Y}] ({NUM_CLASSES} classes).",
                 "- Conformal method: interval-from-distribution central interval + calibration padding q via finite-sample conformal quantile.",
                 f"- Seed: {seed}.",
-                f"- Frozen hyperparameters: Ridge (SGD) alpha={ridge_alpha}; Tree (LightGBM multiclass, num_class={NUM_CLASSES}) params={tree_params}; CNN from `run_zoo.get_conv_net` with fixed optimizer/training schedule.",
+                f"- Frozen hyperparameters: Ridge (SGD) alpha={ridge_alpha}; Tree (LightGBM multiclass, num_class={NUM_CLASSES}) params={tree_params}; CNN full Zoo (CRPS loss, 20% val, early stopping patience=10, same as run_zoo).",
             ]
         )
     )
@@ -424,10 +448,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run training-size conformal stability sweep.")
     parser.add_argument("--alpha", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--toy", action="store_true", help="Quick run: 2 training sizes, 2 CNN epochs. Use to verify pipeline and outputs.")
+    parser.add_argument("--toy", action="store_true", help="Quick run: 5 training sizes (1k–5k) only; full 50-epoch Zoo. Use to verify pipeline and outputs.")
     parser.add_argument("--processed-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--raw-train-csv", type=Path, default=Path("data/raw/train.csv"))
-    parser.add_argument("--out-dir", type=Path, default=Path("plots/training_size_sweep"))
+    parser.add_argument("--out-dir", type=Path, default=Path("results"))
     return parser.parse_args()
 
 
