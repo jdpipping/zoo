@@ -1,7 +1,8 @@
 # prepare_data.py
 numpy
 pandas
-# run_zoo.py
+# run_zoo.py, training_size_sweep.py (tree baseline)
+lightgbm
 scikit-learn
 tensorflow>=2.18,<2.19
 # Mac GPU (Apple Silicon)
