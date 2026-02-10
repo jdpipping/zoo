@@ -2,14 +2,15 @@
 ### FILES & DIRECTORIES ###
 ###########################
 
-# old work
-archived
+# finder tracker
+.DS_Store
 
 # original scripts
 original/
 
-# finder tracker
-.DS_Store
+# raw data
+data/raw/
+
 
 # venv
 *env/
