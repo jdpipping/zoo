@@ -503,10 +503,10 @@ def run_sweep(
 
 
 def make_plot(results: pd.DataFrame, alpha: float, output_path: Path) -> None:
-    """Two panels: mean conformal width and empirical coverage vs n_train, with SE error bars."""
+    """Three panels: mean conformal width, empirical coverage, and NLL vs n_train, with SE error bars."""
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
 
     for model_name, group in results.groupby("model"):
         g = group.sort_values("n_train")
@@ -518,15 +518,21 @@ def make_plot(results: pd.DataFrame, alpha: float, output_path: Path) -> None:
         n = g["n_test"].to_numpy()
         se_cov = np.sqrt(np.maximum(0, p * (1 - p) / n))
         axes[1].errorbar(g["n_train"], g["coverage"], yerr=se_cov, marker="o", label=model_name)
+        axes[2].plot(g["n_train"], g["nll"], marker="o", label=model_name)
 
     axes[0].set_ylabel("Mean conformal interval width")
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
-    axes[1].set_xlabel("Training games")
     axes[1].set_ylabel("Empirical coverage")
     axes[1].axhline(1 - alpha, color="black", linestyle="--", linewidth=1)
     axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    axes[2].set_xlabel("Training games")
+    axes[2].set_ylabel("NLL (test)")
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend()
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
@@ -562,7 +568,7 @@ def write_experiment_readme(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run training-size conformal stability sweep.")
     parser.add_argument("--alpha", type=float, default=0.10)
-    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--seed", type=int, default=209, help="Seed for split and models (209 = day of first run).")
     parser.add_argument("--max-k", type=int, default=50, help="Sweep 20-game chunks up to max_k*20 games. Outputs sweep_{max_k}.csv/.png; one sweep_README.md.")
     parser.add_argument("--local-k", type=int, default=200, help="Calibration neighbors used for local bandwidth in Tibshirani-style weighted conformal intervals.")
     parser.add_argument("--processed-dir", type=Path, default=Path("data/processed"))
