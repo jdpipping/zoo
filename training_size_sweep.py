@@ -130,18 +130,83 @@ def conformal_padding(cal_y: np.ndarray, cal_l: np.ndarray, cal_u: np.ndarray, a
     return q
 
 
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+    """Weighted quantile with nonnegative weights and q in [0, 1]."""
+    if len(values) == 0:
+        return 0.0
+    w = np.clip(np.asarray(weights, dtype=np.float64), 0.0, None)
+    if np.sum(w) <= 0:
+        w = np.ones_like(w)
+
+    order = np.argsort(values)
+    v = np.asarray(values, dtype=np.float64)[order]
+    w = w[order]
+    cdf = np.cumsum(w) / np.sum(w)
+    idx = int(np.searchsorted(cdf, np.clip(q, 0.0, 1.0), side="left"))
+    idx = min(max(idx, 0), len(v) - 1)
+    return float(v[idx])
+
+
+def _locality_features_from_proba(proba: np.ndarray) -> np.ndarray:
+    """Construct low-dim locality features from predictive distributions."""
+    p = normalize_proba_rows(proba)
+    cls = np.arange(NUM_CLASSES, dtype=np.float64)
+    mean = p @ cls
+    second = p @ (cls**2)
+    std = np.sqrt(np.maximum(second - mean**2, 0.0))
+    entropy = -np.sum(p * np.log(np.clip(p, 1e-12, None)), axis=1)
+    return np.stack([mean, std, entropy], axis=1)
+
+
+def local_conformal_padding(
+    cal_y: np.ndarray,
+    cal_l: np.ndarray,
+    cal_u: np.ndarray,
+    cal_feat: np.ndarray,
+    test_feat: np.ndarray,
+    alpha: float,
+    local_k: int,
+) -> np.ndarray:
+    """Tibshirani-style locally weighted conformal padding q(x) for each test point."""
+    scores = np.maximum.reduce([cal_l - cal_y, cal_y - cal_u, np.zeros_like(cal_y)]).astype(np.float64)
+
+    # Standardize locality features so one coordinate cannot dominate distances.
+    feat_scale = np.std(cal_feat, axis=0, ddof=1)
+    feat_scale = np.where(feat_scale > 1e-8, feat_scale, 1.0)
+    cal_scaled = cal_feat / feat_scale
+    test_scaled = test_feat / feat_scale
+
+    n_cal = len(cal_scaled)
+    k = min(max(int(local_k), 5), n_cal)
+    qhat = np.zeros(len(test_scaled), dtype=np.float64)
+    target_q = min(1.0, (1.0 - alpha) * (n_cal + 1) / n_cal)
+
+    for j in range(len(test_scaled)):
+        d2 = np.sum((cal_scaled - test_scaled[j]) ** 2, axis=1)
+        # Adaptive bandwidth from kth-nearest calibration point.
+        kth = np.partition(d2, k - 1)[k - 1]
+        bw = float(np.sqrt(max(kth, 1e-12)))
+        w = np.exp(-0.5 * d2 / (bw**2))
+        qhat[j] = _weighted_quantile(scores, w, target_q)
+
+    return np.ceil(qhat).astype(int)
+
+
 def evaluate_with_conformal(
     cal_proba: np.ndarray,
     test_proba: np.ndarray,
     cal_y: np.ndarray,
     test_y: np.ndarray,
     alpha: float,
+    local_k: int,
 ) -> dict[str, float]:
-    """Central interval from model + conformal q on cal; report mean width, coverage, SE on test."""
+    """Central interval from model + locally weighted conformal q(x) on cal."""
     cal_l, cal_u = central_interval_from_proba(cal_proba, alpha)
     test_l, test_u = central_interval_from_proba(test_proba, alpha)
+    cal_feat = _locality_features_from_proba(cal_proba)
+    test_feat = _locality_features_from_proba(test_proba)
 
-    q = conformal_padding(cal_y, cal_l, cal_u, alpha)
+    q = local_conformal_padding(cal_y, cal_l, cal_u, cal_feat, test_feat, alpha, local_k=local_k)
 
     lo = np.maximum(0, test_l - q)
     hi = np.minimum(NUM_CLASSES - 1, test_u + q)
@@ -160,7 +225,7 @@ def evaluate_with_conformal(
         "se_width": se_width,
         "n_test": float(n_test),
         "coverage": coverage,
-        "q_padding": float(q),
+        "q_padding": float(np.mean(q)),
     }
 
 
@@ -317,6 +382,7 @@ def run_sweep(
     processed_dir: Path,
     raw_csv: Path,
     max_k: int = 50,
+    local_k: int = 200,
 ) -> None:
     set_determinism(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -359,19 +425,25 @@ def run_sweep(
         )
         ridge_cal = _proba_to_num_classes(ridge.predict_proba(tab_x[cal_idx]), ridge.classes_)
         ridge_test = _proba_to_num_classes(ridge.predict_proba(tab_x[test_idx]), ridge.classes_)
-        ridge_metrics = evaluate_with_conformal(ridge_cal, ridge_test, y_cls[cal_idx], y_cls[test_idx], alpha)
+        ridge_metrics = evaluate_with_conformal(
+            ridge_cal, ridge_test, y_cls[cal_idx], y_cls[test_idx], alpha, local_k=local_k
+        )
         ridge_metrics["nll"] = float(log_loss(y_cls[test_idx], ridge_test, labels=ALL_CLASSES))
 
         tree = fit_tree_fixed_classes(tab_x[subset], y_cls[subset], tree_params, seed=seed)
         tree_cal = _proba_to_num_classes(tree.predict_proba(tab_x[cal_idx]), tree.classes_)
         tree_test = _proba_to_num_classes(tree.predict_proba(tab_x[test_idx]), tree.classes_)
-        tree_metrics = evaluate_with_conformal(tree_cal, tree_test, y_cls[cal_idx], y_cls[test_idx], alpha)
+        tree_metrics = evaluate_with_conformal(
+            tree_cal, tree_test, y_cls[cal_idx], y_cls[test_idx], alpha, local_k=local_k
+        )
         tree_metrics["nll"] = float(log_loss(y_cls[test_idx], tree_test, labels=ALL_CLASSES))
 
         cnn_model = train_cnn(train_x[subset], y_cls[subset], seed, epochs=cnn_epochs)
         cnn_cal = cnn_model.predict(train_x[cal_idx], verbose=0)
         cnn_test = cnn_model.predict(train_x[test_idx], verbose=0)
-        cnn_metrics = evaluate_with_conformal(cnn_cal, cnn_test, y_cls[cal_idx], y_cls[test_idx], alpha)
+        cnn_metrics = evaluate_with_conformal(
+            cnn_cal, cnn_test, y_cls[cal_idx], y_cls[test_idx], alpha, local_k=local_k
+        )
         cnn_metrics["nll"] = float(log_loss(y_cls[test_idx], cnn_test, labels=ALL_CLASSES))
 
         for model_name, metrics in [
@@ -407,7 +479,7 @@ def run_sweep(
     make_plot(results, alpha=alpha, output_path=plot_path)
 
     readme_path = out_dir / "sweep_README.md"
-    write_experiment_readme(readme_path, alpha=alpha, seed=seed, ridge_alpha=ridge_alpha, tree_params=tree_params, max_k=max_k)
+    write_experiment_readme(readme_path, alpha=alpha, seed=seed, ridge_alpha=ridge_alpha, tree_params=tree_params, max_k=max_k, local_k=local_k)
 
     config_path = out_dir / f"{output_stem}_config.json"
     config_path.write_text(
@@ -419,6 +491,8 @@ def run_sweep(
                 "label_support": [MIN_IDX_Y, MAX_IDX_Y],
                 "split": "gameId: train_pool=60%, calibration=20%, test=20%",
                 "nested_subsets": "first N games (20-game chunks) from shuffled train pool",
+                "conformal": "locally weighted conformal intervals (Tibshirani-style) over predictive-distribution locality features",
+                "local_k": local_k,
             },
             indent=2,
         )
@@ -464,6 +538,7 @@ def write_experiment_readme(
     ridge_alpha: float,
     tree_params: dict[str, float],
     max_k: int,
+    local_k: int,
 ) -> None:
     path.write_text(
         "\n".join(
@@ -474,7 +549,7 @@ def write_experiment_readme(
                 "- Split scheme: by `GameId` with fixed partitions train_pool=60%, calibration=20%, test=20%.",
                 f"- Miscoverage level: alpha={alpha} (target coverage={1-alpha:.2f}).",
                 f"- Label support: YardIndexClipped in [{MIN_IDX_Y}, {MAX_IDX_Y}] ({NUM_CLASSES} classes).",
-                "- Conformal method: interval-from-distribution central interval + calibration padding q via finite-sample conformal quantile.",
+                f"- Conformal method: interval-from-distribution central interval + Tibshirani-style locally weighted conformal padding q(x) using Gaussian kernel on predictive mean/std/entropy features (k={local_k}).",
                 f"- Seed: {seed}.",
                 f"- Frozen hyperparameters: Ridge (SGD) alpha={ridge_alpha}; Tree (LightGBM multiclass, num_class={NUM_CLASSES}) params={tree_params}; CNN full Zoo (CRPS loss, 20% val, early stopping patience=10, same as run_zoo).",
             ]
@@ -487,6 +562,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--max-k", type=int, default=50, help="Sweep 20-game chunks up to max_k*20 games. Outputs sweep_{max_k}.csv/.png; one sweep_README.md.")
+    parser.add_argument("--local-k", type=int, default=200, help="Calibration neighbors used for local bandwidth in Tibshirani-style weighted conformal intervals.")
     parser.add_argument("--processed-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--raw-train-csv", type=Path, default=Path("data/raw/train.csv"))
     parser.add_argument("--out-dir", type=Path, default=Path("results"))
@@ -502,4 +578,5 @@ if __name__ == "__main__":
         processed_dir=args.processed_dir,
         raw_csv=args.raw_train_csv,
         max_k=args.max_k,
+        local_k=args.local_k,
     )
