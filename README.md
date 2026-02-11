@@ -49,10 +49,10 @@ Run the fixed-split training-size sweep and create the 2-panel stability plot:
 python training_size_sweep.py --alpha 0.10 --seed 123
 ```
 
-Quick run (sweep up to 10k only; writes `sweep_10.csv`, `sweep_10.png`, and one `sweep_README.md`):
+Quick run (sweep up to 200 games only; writes `sweep_10.csv`, `sweep_10.png`, and one `sweep_README.md`):
 
 ```bash
 python training_size_sweep.py --max-k 10
 ```
 
-Outputs in `results/` (override with `--out-dir`): `sweep_{max_k}.csv`, `sweep_{max_k}.png`, `sweep_{max_k}_config.json`, and a single **sweep_README.md** (overwritten each run) describing the sweep (including `--max-k`).
+Outputs in `results/` (override with `--out-dir`): `sweep_{max_k}.csv`, `sweep_{max_k}.png`, `sweep_{max_k}_config.json`, and a single **sweep_README.md**. Sweep uses 20-game chunks (n_train = number of games); plot includes SE error bars.

@@ -1,7 +1,7 @@
 """Training-size sweep for conformalized prediction intervals across Ridge, Tree, and Zoo CNN.
 
-Uses a fixed game-level split (train_pool/calibration/test), nested train subsets in 1,000-play
-steps, and conformal interval padding on top of model central intervals from predictive distributions.
+Uses a fixed game-level split (train_pool/calibration/test), nested train subsets in 20-game
+chunks, and conformal interval padding on top of model central intervals from predictive distributions.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ class SplitData:
     train_pool_idx: np.ndarray
     calibration_idx: np.ndarray
     test_idx: np.ndarray
+    train_games_ordered: np.ndarray  # Shuffled train-pool game IDs for nested subsets
 
 
 def set_determinism(seed: int) -> None:
@@ -84,10 +85,12 @@ def build_game_split(play_map: pd.DataFrame, seed: int, train_frac: float = 0.6,
     test_games = set(games[n_train + n_cal :])
 
     g = play_map["GameId"].to_numpy()
+    train_games_ordered = games[:n_train]  # First n_train games after shuffle
     return SplitData(
         train_pool_idx=np.where(np.isin(g, list(train_games)))[0],
         calibration_idx=np.where(np.isin(g, list(cal_games)))[0],
         test_idx=np.where(np.isin(g, list(test_games)))[0],
+        train_games_ordered=train_games_ordered,
     )
 
 
@@ -134,7 +137,7 @@ def evaluate_with_conformal(
     test_y: np.ndarray,
     alpha: float,
 ) -> dict[str, float]:
-    """Central interval from model + conformal q on cal; report mean width and coverage on test."""
+    """Central interval from model + conformal q on cal; report mean width, coverage, SE on test."""
     cal_l, cal_u = central_interval_from_proba(cal_proba, alpha)
     test_l, test_u = central_interval_from_proba(test_proba, alpha)
 
@@ -145,9 +148,18 @@ def evaluate_with_conformal(
     width = hi - lo
     covered = (test_y >= lo) & (test_y <= hi)
 
+    n_test = len(width)
+    mean_width = float(np.mean(width))
+    std_width = float(np.std(width, ddof=1)) if n_test > 1 else 0.0
+    se_width = std_width / (n_test**0.5)
+    coverage = float(np.mean(covered))
+
     return {
-        "mean_width": float(np.mean(width)),
-        "coverage": float(np.mean(covered)),
+        "mean_width": mean_width,
+        "std_width": std_width,
+        "se_width": se_width,
+        "n_test": float(n_test),
+        "coverage": coverage,
         "q_padding": float(q),
     }
 
@@ -323,26 +335,24 @@ def run_sweep(
 
     split = build_game_split(play_map, seed=seed)
     train_pool = split.train_pool_idx
+    train_games_ordered = split.train_games_ordered
     cal_idx = split.calibration_idx
     test_idx = split.test_idx
+    g = play_map["GameId"].to_numpy()
 
-    # One permutation of train pool; we take first n_train for each size (cal/test fixed).
-    rng = np.random.default_rng(seed)
-    perm_train_pool = rng.permutation(train_pool)
+    ridge_alpha = tune_ridge(tab_x[train_pool], y_cls[train_pool], seed)
+    tree_params = tune_tree(tab_x[train_pool], y_cls[train_pool], seed)
 
-    ridge_alpha = tune_ridge(tab_x[perm_train_pool], y_cls[perm_train_pool], seed)
-    tree_params = tune_tree(tab_x[perm_train_pool], y_cls[perm_train_pool], seed)
-
-    n_max = (len(train_pool) // 1000) * 1000
-    # Sizes 1k, 2k, ... up to max_k thousand (capped by data)
-    max_n = min(max_k * 1000, n_max)
-    sizes = list(range(1000, max_n + 1, 1000))
+    # Sizes 20, 40, 60, ... games (20-game chunks), up to max_k * 20 capped by data
+    max_games = min(max_k * 20, len(train_games_ordered))
+    sizes = list(range(20, max_games + 1, 20))
     cnn_epochs = 50  # full Zoo (match run_zoo)
     output_stem = f"sweep_{max_k}"
     rows: list[dict[str, float | int | str]] = []
 
-    for n_train in sizes:
-        subset = perm_train_pool[:n_train]  # Train on first n_train plays only.
+    for n_games in sizes:
+        first_n_games = set(train_games_ordered[:n_games])
+        subset = train_pool[np.isin(g[train_pool], list(first_n_games))]
 
         ridge = fit_ridge_fixed_classes(
             tab_x[subset], y_cls[subset], alpha=ridge_alpha, seed=seed
@@ -372,8 +382,12 @@ def run_sweep(
             rows.append(
                 {
                     "model": model_name,
-                    "n_train": n_train,
+                    "n_train": n_games,
+                    "n_plays": len(subset),
                     "mean_width": metrics["mean_width"],
+                    "std_width": metrics["std_width"],
+                    "se_width": metrics["se_width"],
+                    "n_test": metrics["n_test"],
                     "coverage": metrics["coverage"],
                     "nll": metrics["nll"],
                     "q_padding": metrics["q_padding"],
@@ -383,7 +397,7 @@ def run_sweep(
                 }
             )
 
-        print(f"Done n_train={n_train}")
+        print(f"Done n_train={n_games} games ({len(subset)} plays)")
 
     results = pd.DataFrame(rows)
     results_path = out_dir / f"{output_stem}.csv"
@@ -404,7 +418,7 @@ def run_sweep(
                 "alpha": alpha,
                 "label_support": [MIN_IDX_Y, MAX_IDX_Y],
                 "split": "gameId: train_pool=60%, calibration=20%, test=20%",
-                "nested_subsets": "first n plays from one seeded permutation",
+                "nested_subsets": "first N games (20-game chunks) from shuffled train pool",
             },
             indent=2,
         )
@@ -413,21 +427,27 @@ def run_sweep(
 
 
 def make_plot(results: pd.DataFrame, alpha: float, output_path: Path) -> None:
-    """Two panels: mean conformal width and empirical coverage vs n_train."""
+    """Two panels: mean conformal width and empirical coverage vs n_train, with SE error bars."""
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
     for model_name, group in results.groupby("model"):
         g = group.sort_values("n_train")
-        axes[0].plot(g["n_train"], g["mean_width"], marker="o", label=model_name)
-        axes[1].plot(g["n_train"], g["coverage"], marker="o", label=model_name)
+        axes[0].errorbar(
+            g["n_train"], g["mean_width"], yerr=g["se_width"], marker="o", label=model_name
+        )
+        # SE for proportion: sqrt(p*(1-p)/n)
+        p = g["coverage"].to_numpy()
+        n = g["n_test"].to_numpy()
+        se_cov = np.sqrt(np.maximum(0, p * (1 - p) / n))
+        axes[1].errorbar(g["n_train"], g["coverage"], yerr=se_cov, marker="o", label=model_name)
 
     axes[0].set_ylabel("Mean conformal interval width")
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
-    axes[1].set_xlabel("Training plays")
+    axes[1].set_xlabel("Training games")
     axes[1].set_ylabel("Empirical coverage")
     axes[1].axhline(1 - alpha, color="black", linestyle="--", linewidth=1)
     axes[1].grid(True, alpha=0.3)
@@ -450,7 +470,7 @@ def write_experiment_readme(
             [
                 "# Training-size conformal sweep",
                 "",
-                f"- Training sizes: 1k, 2k, … up to {max_k}k (controlled by `--max-k`).",
+                f"- Training sizes: 20, 40, … games (20-game chunks up to {max_k * 20} games, `--max-k` = max chunks).",
                 "- Split scheme: by `GameId` with fixed partitions train_pool=60%, calibration=20%, test=20%.",
                 f"- Miscoverage level: alpha={alpha} (target coverage={1-alpha:.2f}).",
                 f"- Label support: YardIndexClipped in [{MIN_IDX_Y}, {MAX_IDX_Y}] ({NUM_CLASSES} classes).",
@@ -466,7 +486,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run training-size conformal stability sweep.")
     parser.add_argument("--alpha", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--max-k", type=int, default=50, help="Sweep training sizes 1k, 2k, … up to this many thousand. Outputs sweep_{max_k}.csv/.png; one sweep_README.md.")
+    parser.add_argument("--max-k", type=int, default=50, help="Sweep 20-game chunks up to max_k*20 games. Outputs sweep_{max_k}.csv/.png; one sweep_README.md.")
     parser.add_argument("--processed-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--raw-train-csv", type=Path, default=Path("data/raw/train.csv"))
     parser.add_argument("--out-dir", type=Path, default=Path("results"))
