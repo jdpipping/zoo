@@ -1,5 +1,5 @@
 {
-  "max_k": 10,
+  "max_k": 50,
   "seed": 123,
   "alpha": 0.1,
   "label_support": [

@@ -225,7 +225,8 @@ def evaluate_with_conformal(
         "se_width": se_width,
         "n_test": float(n_test),
         "coverage": coverage,
-        "q_padding": float(np.mean(q)),
+        "mean_q": float(np.mean(q)),
+        "std_q": float(np.std(q, ddof=1)) if len(q) > 1 else 0.0,
     }
 
 
@@ -462,7 +463,8 @@ def run_sweep(
                     "n_test": metrics["n_test"],
                     "coverage": metrics["coverage"],
                     "nll": metrics["nll"],
-                    "q_padding": metrics["q_padding"],
+                    "mean_q": metrics["mean_q"],
+                    "std_q": metrics["std_q"],
                     "seed": seed,
                     "alpha": alpha,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
