@@ -1,6 +1,6 @@
 # Training-size conformal sweep
 
-- Training sizes: 20, 40, … games (20-game chunks up to 100 games, `--max-k` = max chunks).
+- Training sizes: 20, 40, … games (20-game chunks up to 200 games, `--max-k` = max chunks).
 - Split scheme: by `GameId` with fixed partitions train_pool=60%, calibration=20%, test=20%. Forty games held out from train pool for hyperparameter tuning (tune-val); sweep uses remaining train games.
 - Miscoverage level: alpha=0.1 (target coverage=0.90).
 - Label support: YardIndexClipped in [71, 150] (80 classes).
