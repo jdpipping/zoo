@@ -6,7 +6,7 @@
     71,
     150
   ],
-  "split": "gameId: train_pool=60%, calibration=20%, test=20%",
+  "split": "gameId: train_pool=60%, calibration=20%, test=20%; 40 games held out from train for tune-val",
   "nested_subsets": "first N games (20-game chunks) from shuffled train pool",
   "conformal": "locally weighted conformal intervals (Tibshirani-style) over predictive-distribution locality features",
   "local_k": 200
