@@ -30,6 +30,7 @@ MIN_IDX_Y = 71
 MAX_IDX_Y = 150
 NUM_CLASSES = MAX_IDX_Y - MIN_IDX_Y + 1
 ALL_CLASSES = np.arange(NUM_CLASSES)
+TUNE_VAL_GAMES = 40  # Games held out from train pool for hyperparameter tuning
 
 
 @dataclass
@@ -94,6 +95,12 @@ def build_game_split(play_map: pd.DataFrame, seed: int, train_frac: float = 0.6,
     )
 
 
+def _tabular_df(x: np.ndarray) -> pd.DataFrame:
+    """Wrap tabular array as DataFrame with feature names so LGBM doesn't warn."""
+    n_feat = x.shape[1] if x.ndim > 1 else x.size
+    return pd.DataFrame(x, columns=[f"f{i}" for i in range(n_feat)])
+
+
 def make_tabular_features(train_x: np.ndarray) -> np.ndarray:
     """Flatten spatial dims and aggregate min/mean/max/std for ridge and tree."""
     flat = train_x.reshape(train_x.shape[0], -1, train_x.shape[-1])
@@ -102,6 +109,17 @@ def make_tabular_features(train_x: np.ndarray) -> np.ndarray:
     maxs = flat.max(axis=1)
     stds = flat.std(axis=1)
     return np.concatenate([mins, means, maxs, stds], axis=1)
+
+
+def crps_numpy(y_true: np.ndarray, proba: np.ndarray) -> float:
+    """CRPS for ordinal outcome: L2 on cumulative distributions (scaled by 199, match run_zoo)."""
+    proba = normalize_proba_rows(proba)
+    n = len(y_true)
+    y_oh = np.zeros((n, NUM_CLASSES), dtype=np.float64)
+    y_oh[np.arange(n), y_true.astype(int)] = 1.0
+    cdf_pred = np.cumsum(proba, axis=1)
+    cdf_true = np.cumsum(y_oh, axis=1)
+    return float(np.mean(np.sum((cdf_pred - cdf_true) ** 2, axis=1)) / 199)
 
 
 def one_hot_labels(yard_idx_clipped: np.ndarray) -> np.ndarray:
@@ -288,21 +306,17 @@ def fit_ridge_fixed_classes(
     return clf
 
 
-def tune_ridge(x: np.ndarray, y: np.ndarray, seed: int) -> float:
-    """Pick ridge alpha (1/C) by best NLL on first 5k samples."""
-    n = min(5000, len(x))
-    x_dev = x[:n]
-    y_dev = y[:n]
-    # SGDClassifier uses alpha (reg strength); map from C (inverse reg): alpha = 1/C
+def tune_ridge(x_train: np.ndarray, y_train: np.ndarray, x_val: np.ndarray, y_val: np.ndarray, seed: int) -> float:
+    """Pick ridge alpha (1/C) by best CRPS on tune_val (40 games held out from train pool)."""
     alphas = [1.0 / c for c in (0.1, 0.3, 1.0, 3.0)]
     best_alpha = alphas[0]
-    best_nll = float("inf")
+    best_crps = float("inf")
     for alpha in alphas:
-        model = fit_ridge_fixed_classes(x_dev, y_dev, alpha=alpha, seed=seed)
-        proba = _proba_to_num_classes(model.predict_proba(x_dev), model.classes_)
-        nll = log_loss(y_dev, proba, labels=ALL_CLASSES)
-        if nll < best_nll:
-            best_nll, best_alpha = nll, alpha
+        model = fit_ridge_fixed_classes(x_train, y_train, alpha=alpha, seed=seed)
+        proba = _proba_to_num_classes(model.predict_proba(x_val), model.classes_)
+        crps = crps_numpy(y_val, proba)
+        if crps < best_crps:
+            best_crps, best_alpha = crps, alpha
     return best_alpha
 
 
@@ -318,28 +332,26 @@ def fit_tree_fixed_classes(
         verbose=-1,
         **params,
     )
-    model.fit(x, y)
+    model.fit(_tabular_df(x), y)
     return model
 
 
-def tune_tree(x: np.ndarray, y: np.ndarray, seed: int) -> dict[str, float]:
-    """Pick learning_rate and max_depth by best NLL on first 5k samples."""
-    n = min(5000, len(x))
-    x_dev = x[:n]
-    y_dev = y[:n]
+def tune_tree(x_train: np.ndarray, y_train: np.ndarray, x_val: np.ndarray, y_val: np.ndarray, seed: int) -> dict[str, float]:
+    """Pick hyperparameters by best CRPS on tune_val (40 games held out from train pool)."""
     grid = [
-        {"learning_rate": 0.05, "max_depth": 6},
-        {"learning_rate": 0.05, "max_depth": 10},
-        {"learning_rate": 0.1, "max_depth": 6},
+        {"learning_rate": 0.05, "max_depth": 5, "min_child_samples": 20, "reg_alpha": 0.1, "reg_lambda": 0.1},
+        {"learning_rate": 0.05, "max_depth": 7, "min_child_samples": 20, "reg_alpha": 0.1, "reg_lambda": 0.1},
+        {"learning_rate": 0.1, "max_depth": 5, "min_child_samples": 20, "reg_alpha": 0.1, "reg_lambda": 0.1},
+        {"learning_rate": 0.05, "max_depth": 5, "min_child_samples": 50, "reg_alpha": 0.5, "reg_lambda": 0.5},
     ]
     best = grid[0]
-    best_nll = float("inf")
+    best_crps = float("inf")
     for params in grid:
-        model = fit_tree_fixed_classes(x_dev, y_dev, params, seed=seed)
-        proba = _proba_to_num_classes(model.predict_proba(x_dev), model.classes_)
-        nll = log_loss(y_dev, proba, labels=ALL_CLASSES)
-        if nll < best_nll:
-            best_nll, best = nll, params
+        model = fit_tree_fixed_classes(x_train, y_train, params, seed=seed)
+        proba = _proba_to_num_classes(model.predict_proba(_tabular_df(x_val)), model.classes_)
+        crps = crps_numpy(y_val, proba)
+        if crps < best_crps:
+            best_crps, best = crps, params
     return best
 
 
@@ -407,19 +419,32 @@ def run_sweep(
     test_idx = split.test_idx
     g = play_map["GameId"].to_numpy()
 
-    ridge_alpha = tune_ridge(tab_x[train_pool], y_cls[train_pool], seed)
-    tree_params = tune_tree(tab_x[train_pool], y_cls[train_pool], seed)
+    # Hold out last TUNE_VAL_GAMES from train pool for hyperparameter tuning
+    n_tune_val = min(TUNE_VAL_GAMES, len(train_games_ordered) - 20)  # Keep at least 20 for sweep
+    sweep_train_games = train_games_ordered[: -n_tune_val]
+    tune_val_games = train_games_ordered[-n_tune_val :]
+    sweep_train_pool = train_pool[np.isin(g[train_pool], list(sweep_train_games))]
+    tune_val_idx_arr = np.where(np.isin(g, list(tune_val_games)))[0]
 
-    # Sizes 20, 40, 60, ... games (20-game chunks), up to max_k * 20 capped by data
-    max_games = min(max_k * 20, len(train_games_ordered))
+    ridge_alpha = tune_ridge(
+        tab_x[sweep_train_pool], y_cls[sweep_train_pool],
+        tab_x[tune_val_idx_arr], y_cls[tune_val_idx_arr], seed
+    )
+    tree_params = tune_tree(
+        tab_x[sweep_train_pool], y_cls[sweep_train_pool],
+        tab_x[tune_val_idx_arr], y_cls[tune_val_idx_arr], seed
+    )
+
+    # Sizes 20, 40, 60, ... games (20-game chunks), up to max_k * 20 capped by sweep-train games
+    max_games = min(max_k * 20, len(sweep_train_games))
     sizes = list(range(20, max_games + 1, 20))
     cnn_epochs = 50  # full Zoo (match run_zoo)
     output_stem = f"sweep_{max_k}"
     rows: list[dict[str, float | int | str]] = []
 
     for n_games in sizes:
-        first_n_games = set(train_games_ordered[:n_games])
-        subset = train_pool[np.isin(g[train_pool], list(first_n_games))]
+        first_n_games = set(sweep_train_games[:n_games])
+        subset = sweep_train_pool[np.isin(g[sweep_train_pool], list(first_n_games))]
 
         ridge = fit_ridge_fixed_classes(
             tab_x[subset], y_cls[subset], alpha=ridge_alpha, seed=seed
@@ -429,15 +454,19 @@ def run_sweep(
         ridge_metrics = evaluate_with_conformal(
             ridge_cal, ridge_test, y_cls[cal_idx], y_cls[test_idx], alpha, local_k=local_k
         )
-        ridge_metrics["nll"] = float(log_loss(y_cls[test_idx], ridge_test, labels=ALL_CLASSES))
+        ridge_metrics["crps"] = crps_numpy(y_cls[test_idx], ridge_test)
 
         tree = fit_tree_fixed_classes(tab_x[subset], y_cls[subset], tree_params, seed=seed)
-        tree_cal = _proba_to_num_classes(tree.predict_proba(tab_x[cal_idx]), tree.classes_)
-        tree_test = _proba_to_num_classes(tree.predict_proba(tab_x[test_idx]), tree.classes_)
+        tree_cal = _proba_to_num_classes(
+            tree.predict_proba(_tabular_df(tab_x[cal_idx])), tree.classes_
+        )
+        tree_test = _proba_to_num_classes(
+            tree.predict_proba(_tabular_df(tab_x[test_idx])), tree.classes_
+        )
         tree_metrics = evaluate_with_conformal(
             tree_cal, tree_test, y_cls[cal_idx], y_cls[test_idx], alpha, local_k=local_k
         )
-        tree_metrics["nll"] = float(log_loss(y_cls[test_idx], tree_test, labels=ALL_CLASSES))
+        tree_metrics["crps"] = crps_numpy(y_cls[test_idx], tree_test)
 
         cnn_model = train_cnn(train_x[subset], y_cls[subset], seed, epochs=cnn_epochs)
         cnn_cal = cnn_model.predict(train_x[cal_idx], verbose=0)
@@ -445,7 +474,7 @@ def run_sweep(
         cnn_metrics = evaluate_with_conformal(
             cnn_cal, cnn_test, y_cls[cal_idx], y_cls[test_idx], alpha, local_k=local_k
         )
-        cnn_metrics["nll"] = float(log_loss(y_cls[test_idx], cnn_test, labels=ALL_CLASSES))
+        cnn_metrics["crps"] = crps_numpy(y_cls[test_idx], cnn_test)
 
         for model_name, metrics in [
             ("ridge_multinomial", ridge_metrics),
@@ -462,7 +491,7 @@ def run_sweep(
                     "se_width": metrics["se_width"],
                     "n_test": metrics["n_test"],
                     "coverage": metrics["coverage"],
-                    "nll": metrics["nll"],
+                    "crps": metrics["crps"],
                     "mean_q": metrics["mean_q"],
                     "std_q": metrics["std_q"],
                     "seed": seed,
@@ -491,7 +520,7 @@ def run_sweep(
                 "seed": seed,
                 "alpha": alpha,
                 "label_support": [MIN_IDX_Y, MAX_IDX_Y],
-                "split": "gameId: train_pool=60%, calibration=20%, test=20%",
+                "split": "gameId: train_pool=60%, calibration=20%, test=20%; 40 games held out from train for tune-val",
                 "nested_subsets": "first N games (20-game chunks) from shuffled train pool",
                 "conformal": "locally weighted conformal intervals (Tibshirani-style) over predictive-distribution locality features",
                 "local_k": local_k,
@@ -503,7 +532,7 @@ def run_sweep(
 
 
 def make_plot(results: pd.DataFrame, alpha: float, output_path: Path) -> None:
-    """Three panels: mean conformal width, empirical coverage, and NLL vs n_train, with SE error bars."""
+    """Three panels: mean conformal width, empirical coverage, and CRPS vs n_train, with SE error bars."""
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
@@ -518,7 +547,7 @@ def make_plot(results: pd.DataFrame, alpha: float, output_path: Path) -> None:
         n = g["n_test"].to_numpy()
         se_cov = np.sqrt(np.maximum(0, p * (1 - p) / n))
         axes[1].errorbar(g["n_train"], g["coverage"], yerr=se_cov, marker="o", label=model_name)
-        axes[2].plot(g["n_train"], g["nll"], marker="o", label=model_name)
+        axes[2].plot(g["n_train"], g["crps"], marker="o", label=model_name)
 
     axes[0].set_ylabel("Mean conformal interval width")
     axes[0].grid(True, alpha=0.3)
@@ -530,7 +559,7 @@ def make_plot(results: pd.DataFrame, alpha: float, output_path: Path) -> None:
     axes[1].legend()
 
     axes[2].set_xlabel("Training games")
-    axes[2].set_ylabel("NLL (test)")
+    axes[2].set_ylabel("CRPS (test)")
     axes[2].grid(True, alpha=0.3)
     axes[2].legend()
 
@@ -554,12 +583,12 @@ def write_experiment_readme(
                 "# Training-size conformal sweep",
                 "",
                 f"- Training sizes: 20, 40, … games (20-game chunks up to {max_k * 20} games, `--max-k` = max chunks).",
-                "- Split scheme: by `GameId` with fixed partitions train_pool=60%, calibration=20%, test=20%.",
+                "- Split scheme: by `GameId` with fixed partitions train_pool=60%, calibration=20%, test=20%. Forty games held out from train pool for hyperparameter tuning (tune-val); sweep uses remaining train games.",
                 f"- Miscoverage level: alpha={alpha} (target coverage={1-alpha:.2f}).",
                 f"- Label support: YardIndexClipped in [{MIN_IDX_Y}, {MAX_IDX_Y}] ({NUM_CLASSES} classes).",
                 f"- Conformal method: interval-from-distribution central interval + Tibshirani-style locally weighted conformal padding q(x) using Gaussian kernel on predictive mean/std/entropy features (k={local_k}).",
                 f"- Seed: {seed}.",
-                f"- Frozen hyperparameters: Ridge (SGD) alpha={ridge_alpha}; Tree (LightGBM multiclass, num_class={NUM_CLASSES}) params={tree_params}; CNN full Zoo (CRPS loss, 20% val, early stopping patience=10, same as run_zoo).",
+                f"- Frozen hyperparameters: Ridge (SGD) alpha={ridge_alpha} (tuned on CRPS); Tree (LightGBM multiclass, num_class={NUM_CLASSES}) params={tree_params} (tuned on CRPS); CNN full Zoo (CRPS loss, 20% val, early stopping patience=10, same as run_zoo).",
             ]
         )
     )
