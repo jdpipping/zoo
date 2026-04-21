@@ -218,7 +218,12 @@ def evaluate_with_conformal(
     alpha: float,
     local_k: int,
 ) -> dict[str, float]:
-    """Central interval from model + locally weighted conformal q(x) on cal."""
+    """Central interval from model + locally weighted conformal q(x) on cal.
+
+    Width convention in reported metrics:
+      width = hi - lo  (index-gap width in class bins)
+      inclusive_bin_count = width + 1
+    """
     cal_l, cal_u = central_interval_from_proba(cal_proba, alpha)
     test_l, test_u = central_interval_from_proba(test_proba, alpha)
     cal_feat = _locality_features_from_proba(cal_proba)
@@ -229,16 +234,19 @@ def evaluate_with_conformal(
     lo = np.maximum(0, test_l - q)
     hi = np.minimum(NUM_CLASSES - 1, test_u + q)
     width = hi - lo
+    width_inclusive = width + 1
     covered = (test_y >= lo) & (test_y <= hi)
 
     n_test = len(width)
     mean_width = float(np.mean(width))
+    mean_width_inclusive = float(np.mean(width_inclusive))
     std_width = float(np.std(width, ddof=1)) if n_test > 1 else 0.0
     se_width = std_width / (n_test**0.5)
     coverage = float(np.mean(covered))
 
     return {
         "mean_width": mean_width,
+        "mean_width_inclusive": mean_width_inclusive,
         "std_width": std_width,
         "se_width": se_width,
         "n_test": float(n_test),
@@ -487,6 +495,7 @@ def run_sweep(
                     "n_train": n_games,
                     "n_plays": len(subset),
                     "mean_width": metrics["mean_width"],
+                    "mean_width_inclusive": metrics["mean_width_inclusive"],
                     "std_width": metrics["std_width"],
                     "se_width": metrics["se_width"],
                     "n_test": metrics["n_test"],
@@ -496,6 +505,7 @@ def run_sweep(
                     "std_q": metrics["std_q"],
                     "seed": seed,
                     "alpha": alpha,
+                    "width_definition": "index_gap_hi_minus_lo",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -524,6 +534,10 @@ def run_sweep(
                 "nested_subsets": "first N games (20-game chunks) from shuffled train pool",
                 "conformal": "locally weighted conformal intervals (Tibshirani-style) over predictive-distribution locality features",
                 "local_k": local_k,
+                "width_definition": {
+                    "mean_width": "hi - lo (index-gap width in class bins)",
+                    "mean_width_inclusive": "(hi - lo + 1) (inclusive class-count width in bins)",
+                },
             },
             indent=2,
         )
@@ -549,7 +563,7 @@ def make_plot(results: pd.DataFrame, alpha: float, output_path: Path) -> None:
         axes[1].errorbar(g["n_train"], g["coverage"], yerr=se_cov, marker="o", label=model_name)
         axes[2].plot(g["n_train"], g["crps"], marker="o", label=model_name)
 
-    axes[0].set_ylabel("Mean conformal interval width")
+    axes[0].set_ylabel("Mean conformal interval width (hi - lo)")
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
@@ -587,6 +601,7 @@ def write_experiment_readme(
                 f"- Miscoverage level: alpha={alpha} (target coverage={1-alpha:.2f}).",
                 f"- Label support: YardIndexClipped in [{MIN_IDX_Y}, {MAX_IDX_Y}] ({NUM_CLASSES} classes).",
                 f"- Conformal method: interval-from-distribution central interval + Tibshirani-style locally weighted conformal padding q(x) using Gaussian kernel on predictive mean/std/entropy features (k={local_k}).",
+                "- Width definition in outputs: `mean_width = hi - lo` (index-gap width in class bins); `mean_width_inclusive = hi - lo + 1` (inclusive class-count width).",
                 f"- Seed: {seed}.",
                 f"- Frozen hyperparameters: Ridge (SGD) alpha={ridge_alpha} (tuned on CRPS); Tree (LightGBM multiclass, num_class={NUM_CLASSES}) params={tree_params} (tuned on CRPS); CNN full Zoo (CRPS loss, 20% val, early stopping patience=10, same as run_zoo).",
             ]

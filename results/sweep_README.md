@@ -5,5 +5,6 @@
 - Miscoverage level: alpha=0.1 (target coverage=0.90).
 - Label support: YardIndexClipped in [71, 150] (80 classes).
 - Conformal method: interval-from-distribution central interval + Tibshirani-style locally weighted conformal padding q(x) using Gaussian kernel on predictive mean/std/entropy features (k=200).
+- Width definition in outputs: `mean_width = hi - lo` (index-gap width in class bins); `mean_width_inclusive = hi - lo + 1` (inclusive class-count width).
 - Seed: 209.
 - Frozen hyperparameters: Ridge (SGD) alpha=0.3333333333333333 (tuned on CRPS); Tree (LightGBM multiclass, num_class=80) params={'learning_rate': 0.05, 'max_depth': 5, 'min_child_samples': 50, 'reg_alpha': 0.5, 'reg_lambda': 0.5} (tuned on CRPS); CNN full Zoo (CRPS loss, 20% val, early stopping patience=10, same as run_zoo).

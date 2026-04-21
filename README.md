@@ -30,7 +30,7 @@ Dependencies are in `requirements.txt` (includes `tensorflow-metal` for Mac GPU)
    ```bash
    python run_zoo.py
    ```
-   Loads processed data and runs 8-fold cross-validation (train 8 CNNs, report mean validation CRPS). After the first fold it prints an estimated total runtime. Use `CV_WORKERS = 1` for a single GPU (e.g. Mac Metal); set `CV_WORKERS = 2`–`8` to run folds in parallel on CPU.
+   Loads processed data and runs 8-fold **grouped** cross-validation by base `PlayId` (so original and `_aug` copies never split across train/validation). Trains 8 CNNs and reports mean validation CRPS. After the first fold it prints an estimated total runtime. Use `CV_WORKERS = 1` for a single GPU (e.g. Mac Metal); set `CV_WORKERS = 2`–`8` to run folds in parallel on CPU.
 
 ## Original notebooks
 
@@ -56,3 +56,7 @@ python training_size_sweep.py --max-k 10
 ```
 
 Outputs in `results/` (override with `--out-dir`): `sweep_{max_k}.csv`, `sweep_{max_k}.png`, `sweep_{max_k}_config.json`, and a single **sweep_README.md**. Sweep uses 20-game chunks (n_train = number of games); plot includes SE error bars.
+
+Width columns in sweep outputs are explicit:
+- `mean_width = hi - lo` (index-gap width in class bins)
+- `mean_width_inclusive = hi - lo + 1` (inclusive class-count width)

@@ -11,6 +11,9 @@ original/
 # big data
 data/
 
+# raw src
+*.tex
+
 ##############
 ### PYTHON ###
 ##############

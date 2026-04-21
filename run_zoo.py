@@ -19,7 +19,7 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras import backend as K
 from tensorflow.keras.callbacks import Callback, EarlyStopping
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold
 
 DATA_DIR = "data/processed"
 TRAIN_X_PATH = f"{DATA_DIR}/train_x.npy"
@@ -145,15 +145,35 @@ def estimate_cv_runtime(n_folds=8, minutes_per_fold=None):
     return {"minutes_per_fold": minutes_per_fold, "estimated_total_minutes": n_folds * minutes_per_fold}
 
 
+def build_grouped_play_folds(train_x: np.ndarray, train_y: pd.DataFrame, n_splits: int = 8):
+    """Group folds by base PlayId so original and mirrored _aug rows stay in the same fold."""
+    if "PlayId" not in train_y.columns:
+        raise ValueError("train_y must include PlayId for grouped CV.")
+
+    groups = train_y["PlayId"].astype(str).str.replace("_aug", "", regex=False).to_numpy()
+    gkf = GroupKFold(n_splits=n_splits)
+    fold_splits = list(gkf.split(train_x, train_y, groups=groups))
+
+    # Safety check: no base-play overlap between train and val in any fold.
+    for i, (tdx, vdx) in enumerate(fold_splits):
+        overlap = np.intersect1d(groups[tdx], groups[vdx], assume_unique=False)
+        if overlap.size > 0:
+            raise RuntimeError(f"Group leakage detected in fold {i}: {overlap.size} overlapping base PlayIds.")
+
+    return fold_splits, groups
+
+
 def main():
-    """8-fold CV: train Zoo CNN per fold with CRPS + early stopping, report mean val CRPS."""
+    """8-fold grouped CV: keep original/_aug pairs together, train Zoo CNN, report mean val CRPS."""
     train_x = np.load(TRAIN_X_PATH)
     train_y = pd.read_pickle(TRAIN_Y_PATH)
     df_season = pd.read_pickle(DF_SEASON_PATH)
 
     models = []
-    kf = KFold(n_splits=8, shuffle=True, random_state=42)
-    fold_splits = list(kf.split(train_x, train_y))
+    fold_splits, play_groups = build_grouped_play_folds(train_x, train_y, n_splits=8)
+    n_groups = int(np.unique(play_groups).size)
+    n_aug_rows = int(train_y["PlayId"].astype(str).str.endswith("_aug").sum()) if "PlayId" in train_y.columns else 0
+    print(f"Using GroupKFold by base PlayId: {n_groups} groups, {n_aug_rows} augmented rows.")
     score = []
 
     if CV_WORKERS <= 1:
@@ -221,7 +241,10 @@ def main():
                 "mean_val_crps": mean_crps,
                 "fold_val_crps": [float(s) for s in score],
                 "n_splits": 8,
-                "random_state": 42,
+                "splitter": "GroupKFold",
+                "group_key": "base PlayId (PlayId without _aug)",
+                "n_groups": n_groups,
+                "n_aug_rows": n_aug_rows,
                 "epochs": 50,
                 "batch_size": 64,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
